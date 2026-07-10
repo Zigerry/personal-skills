@@ -1,6 +1,6 @@
 ---
 name: session-analysis
-description: Analyze local Codex or Claude Code JSONL sessions into a redacted, readable audit, then explain goals, outcomes, tool failures, retries, interruptions, and unfinished work from evidence. Use when a user asks to analyze the current or previous session, understand a confusing transcript, audit tool usage, diagnose why an agent run went off track, compare what was attempted with what completed, or summarize a session ID/path. Triggers include 分析会话、分析上次 session、看看刚才做了什么、为什么这个会话这么乱、审计工具调用、analyze session、analyze previous session、audit agent run、what happened in this transcript.
+description: Analyze local Codex or Claude Code JSONL sessions into a redacted audit with observed duration, subagent timing, transcript-reported context usage, compaction history, goals, outcomes, tool failures, retries, interruptions, and unfinished work. Use when a user asks to analyze a current or previous session, understand a confusing transcript, audit tool usage or agent performance, diagnose why a run went off track, compare what was attempted with what completed, or summarize a session ID/path. Triggers include 分析会话、分析上次 session、上下文占用、compact 了几次、subagent 耗时、analyze session、audit agent run、what happened in this transcript.
 ---
 
 # Session Analysis
@@ -55,16 +55,21 @@ The parser uses only Node.js standard-library modules. It writes a private repor
 
 Redaction is enabled by default. Use `--no-redact` only after the user explicitly requests raw values and confirms a safe output location.
 
+Parent reports always summarize discovered child-agent IDs, observed spans, context metrics, and compaction counts without mixing child conversations into the parent transcript. Use `--include-agents --list` to list child transcripts, or combine `--include-agents` with a child ID to analyze that child in full.
+
 ## Interpret the report
 
 Read the generated Markdown. Give the user a compact, evidence-based analysis with:
 
-1. **Goal and outcome** — what the user wanted, what completed, and what did not.
-2. **Execution path** — the important turns and tool actions, not a line-by-line retelling.
-3. **Failures and friction** — failed calls, retries, rollbacks, compaction, wrong assumptions, or missing context. Distinguish a confirmed error from an inference.
-4. **Changes and decisions** — files, commands, design choices, or external actions supported by the report.
-5. **Unfinished work** — open items and the smallest safe next step.
-6. **Confidence limits** — malformed lines, unknown event types, omitted system/reasoning data, missing tool results, or an actively growing session.
+1. **Execution metrics** — observed start/end span, each agent's span, transcript-reported context usage, and every compaction timestamp. State when a context-window size is unavailable; never infer one from the model name.
+2. **Goal and outcome** — what the user wanted, what completed, and what did not.
+3. **Execution path** — the important turns and tool actions, not a line-by-line retelling.
+4. **Failures and friction** — failed calls, retries, rollbacks, compaction, wrong assumptions, or missing context. Distinguish a confirmed error from an inference.
+5. **Changes and decisions** — files, commands, design choices, or external actions supported by the report.
+6. **Unfinished work** — open items and the smallest safe next step.
+7. **Confidence limits** — malformed lines, unknown event types, omitted system/reasoning data, missing tool results, or an actively growing session.
+
+Treat "observed duration" as the wall-clock span between the first and last transcript timestamps; it may include user idle time. Treat token totals as provider-reported usage, not a cross-provider billing comparison. The report calculates occupancy percentages only when the transcript supplies both input usage and a context-window size.
 
 Link conclusions to concrete timestamps, tool names, call IDs, or report sections. Say “not proven by the transcript” when evidence is absent.
 
@@ -75,7 +80,7 @@ Link conclusions to concrete timestamps, tool names, call IDs, or report section
 - Keep default redaction on for tokens, passwords, authorization headers, URL credentials, cookies, and common key formats.
 - Treat a warning about the current Codex session as an incomplete snapshot, not a completed run.
 - For Claude Code, use the active `uuid`/`parentUuid` branch selected by `last-prompt`; report excluded side branches rather than mixing abandoned paths into the timeline.
-- For Codex, exclude child-agent sessions by default; add `--include-agents` only when the user asks to analyze subagents.
+- Keep child-agent conversation content separate from the parent audit. Parent reports include child metrics by default; full child transcripts require explicit selection with `--include-agents`.
 - Surface parser coverage. Never claim a full-fidelity analysis when malformed, unknown, unmatched, or omitted counts are material.
 
 ## Recover from targeting failures

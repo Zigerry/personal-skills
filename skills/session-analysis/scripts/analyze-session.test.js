@@ -194,6 +194,122 @@ test('parses Codex response items once and identifies a failed tool result', () 
   assert.doesNotMatch(JSON.stringify(session), /hidden summary/);
 });
 
+test('reports Codex duration, context usage, and deduplicated compactions', () => {
+  const input = jsonl([
+    {
+      timestamp: '2026-07-10T03:00:00.000Z', type: 'session_meta',
+      payload: { id: 'codex-metrics', cwd: '/repo' },
+    },
+    {
+      timestamp: '2026-07-10T03:00:01.000Z', type: 'event_msg',
+      payload: { type: 'token_count', info: {
+        total_token_usage: { input_tokens: 400, output_tokens: 20, total_tokens: 420 },
+        last_token_usage: { input_tokens: 400, output_tokens: 20, total_tokens: 420 },
+        model_context_window: 1000,
+      } },
+    },
+    {
+      timestamp: '2026-07-10T03:00:10.000Z', type: 'compacted',
+      payload: { window_number: 2, message: 'private summary', replacement_history: [] },
+    },
+    {
+      timestamp: '2026-07-10T03:00:10.002Z', type: 'event_msg',
+      payload: { type: 'context_compacted' },
+    },
+    {
+      timestamp: '2026-07-10T03:00:15.000Z', type: 'compacted',
+      payload: { window_number: 3, message: 'another private summary', replacement_history: [] },
+    },
+    {
+      timestamp: '2026-07-10T03:00:15.003Z', type: 'event_msg',
+      payload: { type: 'context_compacted' },
+    },
+    {
+      timestamp: '2026-07-10T03:00:20.000Z', type: 'event_msg',
+      payload: { type: 'token_count', info: {
+        total_token_usage: { input_tokens: 1200, output_tokens: 50, total_tokens: 1250 },
+        last_token_usage: { input_tokens: 800, cached_input_tokens: 300, output_tokens: 30, total_tokens: 830 },
+        model_context_window: 1000,
+      } },
+    },
+  ]);
+
+  const session = analyzer().parseTranscript(input, 'codex', '/tmp/codex-metrics.jsonl');
+  const report = analyzer().renderReport(session);
+
+  assert.equal(session.metrics.durationMs, 20_000);
+  assert.equal(session.metrics.context.sampleCount, 2);
+  assert.equal(session.metrics.context.last.inputTokens, 800);
+  assert.equal(session.metrics.context.last.occupancyPercent, 80);
+  assert.equal(session.metrics.context.cumulative.totalTokens, 1250);
+  assert.equal(session.metrics.compactions.length, 2);
+  assert.equal(session.metrics.compactions[0].windowNumber, 2);
+  assert.equal(session.metrics.compactions[1].windowNumber, 3);
+  assert.doesNotMatch(JSON.stringify(session), /private summary|another private summary/);
+  assert.match(report, /\*\*Observed duration:\*\* 20s/);
+  assert.match(report, /## Context and compaction/);
+  assert.match(report, /80\.0%/);
+  assert.match(report, /\| Compactions \| 2 \|/);
+  assert.match(report, /2026-07-10T03:00:10\.000Z/);
+  assert.match(report, /2026-07-10T03:00:15\.000Z/);
+});
+
+test('reports Claude Code usage and compaction without inventing a context window', () => {
+  const input = jsonl([
+    {
+      type: 'user', sessionId: 'claude-metrics', cwd: '/repo', timestamp: '2026-07-10T04:00:00.000Z',
+      message: { content: 'Start' },
+    },
+    {
+      type: 'assistant', sessionId: 'claude-metrics', cwd: '/repo', timestamp: '2026-07-10T04:00:01.000Z',
+      message: {
+        id: 'message-1', model: 'claude-test',
+        usage: { input_tokens: 100, cache_creation_input_tokens: 20, cache_read_input_tokens: 30, output_tokens: 10 },
+        content: [{ type: 'text', text: 'Working' }],
+      },
+    },
+    {
+      type: 'assistant', sessionId: 'claude-metrics', cwd: '/repo', timestamp: '2026-07-10T04:00:02.000Z',
+      message: {
+        id: 'message-1', model: 'claude-test',
+        usage: { input_tokens: 100, cache_creation_input_tokens: 20, cache_read_input_tokens: 30, output_tokens: 25 },
+        content: [],
+      },
+    },
+    {
+      type: 'system', subtype: 'compact_boundary', sessionId: 'claude-metrics',
+      timestamp: '2026-07-10T04:00:03.000Z',
+      compact_metadata: { trigger: 'auto', pre_tokens: 150 },
+    },
+    {
+      type: 'user', sessionId: 'claude-metrics', cwd: '/repo', timestamp: '2026-07-10T04:00:03.100Z',
+      isCompactSummary: true, message: { content: 'private compact summary' },
+    },
+    {
+      type: 'assistant', sessionId: 'claude-metrics', cwd: '/repo', timestamp: '2026-07-10T04:00:05.000Z',
+      message: {
+        id: 'message-2', model: 'claude-test', usage: { input_tokens: 40, output_tokens: 5 },
+        content: [{ type: 'text', text: 'Done' }],
+      },
+    },
+  ]);
+
+  const session = analyzer().parseTranscript(input, 'claude-code', '/tmp/claude-metrics.jsonl');
+  const report = analyzer().renderReport(session);
+
+  assert.equal(session.metrics.durationMs, 5_000);
+  assert.equal(session.metrics.context.sampleCount, 2);
+  assert.equal(session.metrics.context.peak.inputTokens, 150);
+  assert.equal(session.metrics.context.peak.occupancyPercent, null);
+  assert.equal(session.metrics.context.cumulative.inputTokens, 190);
+  assert.equal(session.metrics.context.cumulative.outputTokens, 30);
+  assert.equal(session.metrics.compactions.length, 1);
+  assert.equal(session.metrics.compactions[0].trigger, 'auto');
+  assert.equal(session.metrics.compactions[0].preTokens, 150);
+  assert.doesNotMatch(JSON.stringify(session), /private compact summary/);
+  assert.match(report, /150 tokens \(window unavailable\)/);
+});
+
 test('prefers Codex event messages per role without leaking injected user context', () => {
   const input = jsonl([
     { timestamp: '2026-07-10T03:10:00Z', type: 'session_meta', payload: { id: 'codex-user-only', cwd: '/repo' } },
@@ -330,6 +446,11 @@ test('renders a bounded Markdown audit with coverage and no raw secrets', () => 
   assert.match(report, /^# Session analysis/m);
   assert.match(report, /## Findings/);
   assert.match(report, /1 failed tool call/);
+  assert.match(report, /\*\*Observed duration:\*\* 2s/);
+  assert.match(report, /## Agent sessions/);
+  assert.match(report, /## Context and compaction/);
+  assert.match(report, /\| Compactions \| 0 \|/);
+  assert.match(report, /Context samples \| 0/);
   assert.match(report, /## Parser coverage/);
   assert.match(report, /\[REDACTED\]/);
   assert.match(report, /&lt;!--/);
@@ -357,6 +478,75 @@ test('discovers project-matching sessions and selects the previous one', () => {
   assert.deepEqual(candidates.map((candidate) => candidate.id), ['new', 'old']);
   assert.equal(analyzer().selectCandidate(candidates, 'latest').id, 'new');
   assert.equal(analyzer().selectCandidate(candidates, 'previous').id, 'old');
+});
+
+test('discovers and summarizes Codex child sessions without mixing their transcripts', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'session-analysis-codex-agents-'));
+  const root = path.join(tmp, 'sessions');
+  const day = path.join(root, '2026', '07', '10');
+  fs.mkdirSync(day, { recursive: true });
+  const parentFile = path.join(day, 'rollout-parent.jsonl');
+  const childFile = path.join(day, 'rollout-child.jsonl');
+  fs.writeFileSync(parentFile, jsonl([
+    { timestamp: '2026-07-10T01:00:00Z', type: 'session_meta', payload: { id: 'parent', cwd: '/repo' } },
+    { timestamp: '2026-07-10T01:00:10Z', type: 'event_msg', payload: { type: 'agent_message', message: 'parent done' } },
+  ]));
+  fs.writeFileSync(childFile, jsonl([
+    { timestamp: '2026-07-10T01:00:02Z', type: 'session_meta', payload: { id: 'child', parent_thread_id: 'parent', cwd: '/repo' } },
+    { timestamp: '2026-07-10T01:00:07Z', type: 'event_msg', payload: { type: 'agent_message', message: 'private child output' } },
+  ]));
+
+  const candidates = analyzer().discoverCandidates({
+    source: 'codex', project: '/repo', includeAgents: true, roots: { codex: root },
+  });
+  const session = analyzer().analyzeFile(parentFile, 'codex');
+  analyzer().attachAgentSessions(session, candidates);
+  const report = analyzer().renderReport(session);
+
+  assert.equal(session.agentSessions.length, 2);
+  assert.deepEqual(session.agentSessions.map((agent) => agent.id), ['parent', 'child']);
+  assert.equal(session.agentSessions[1].parentId, 'parent');
+  assert.equal(session.agentSessions[1].durationMs, 5_000);
+  assert.match(report, /\*\*Subagent sessions:\*\* 1/);
+  assert.match(report, /## Agent sessions/);
+  assert.match(report, /\| Subagent \| child \| parent \| 2026-07-10T01:00:02Z \| 2026-07-10T01:00:07Z \| 5s \|/);
+  assert.doesNotMatch(report, /private child output/);
+});
+
+test('gives Claude Code subagents unique IDs and summarizes their duration', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'session-analysis-claude-agents-'));
+  const root = path.join(tmp, 'projects');
+  const projectDir = path.join(root, 'encoded-project');
+  const parentFile = path.join(projectDir, 'claude-parent.jsonl');
+  const childDir = path.join(projectDir, 'claude-parent', 'subagents');
+  const childFile = path.join(childDir, 'agent-worker-1.jsonl');
+  fs.mkdirSync(childDir, { recursive: true });
+  fs.writeFileSync(parentFile, jsonl([
+    { type: 'user', sessionId: 'claude-parent', cwd: '/repo', timestamp: '2026-07-10T02:00:00Z', message: { content: 'start' } },
+    { type: 'assistant', sessionId: 'claude-parent', cwd: '/repo', timestamp: '2026-07-10T02:00:10Z', message: { content: [{ type: 'text', text: 'done' }] } },
+  ]));
+  fs.writeFileSync(childFile, jsonl([
+    { type: 'user', sessionId: 'claude-parent', agentId: 'worker-1', cwd: '/repo', timestamp: '2026-07-10T02:00:02Z', message: { content: 'private child request' } },
+    { type: 'assistant', sessionId: 'claude-parent', agentId: 'worker-1', cwd: '/repo', timestamp: '2026-07-10T02:00:08Z', message: { content: [{ type: 'text', text: 'private child result' }] } },
+  ]));
+
+  const candidates = analyzer().discoverCandidates({
+    source: 'claude-code', project: '/repo', includeAgents: true, roots: { 'claude-code': root },
+  });
+  const session = analyzer().analyzeFile(parentFile, 'claude-code');
+  analyzer().attachAgentSessions(session, candidates);
+  const report = analyzer().renderReport(session);
+
+  assert.deepEqual(candidates.map((candidate) => candidate.id).sort(), ['claude-parent', 'worker-1']);
+  assert.equal(candidates.find((candidate) => candidate.id === 'worker-1').parentThreadId, 'claude-parent');
+  assert.equal(analyzer().selectCandidate(candidates, 'worker-1').file, childFile);
+  assert.deepEqual(analyzer().discoverCandidates({
+    source: 'claude-code', project: '/repo', roots: { 'claude-code': root },
+  }).map((candidate) => candidate.id), ['claude-parent']);
+  assert.equal(session.agentSessions.length, 2);
+  assert.equal(session.agentSessions[1].durationMs, 6_000);
+  assert.match(report, /\| Subagent \| worker-1 \| claude-parent \| 2026-07-10T02:00:02Z \| 2026-07-10T02:00:08Z \| 6s \|/);
+  assert.doesNotMatch(report, /private child request|private child result/);
 });
 
 test('Codex current and previous selectors honor the active thread marker', () => {

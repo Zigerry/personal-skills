@@ -11,6 +11,8 @@ const MAX_TEXT_CHARS = 6_000;
 const MAX_TEXT_LINES = 80;
 const CANDIDATE_HEAD_BYTES = 256 * 1024;
 const CANDIDATE_TAIL_BYTES = 64 * 1024;
+const CODEX_COMPACTION_PAIR_MS = 1_000;
+const CLAUDE_COMPACTION_PAIR_MS = 30_000;
 
 function canonicalProvider(provider) {
   if (!provider || provider === 'auto') return 'auto';
@@ -46,6 +48,142 @@ function coverageTemplate() {
     sideBranchRecords: 0,
     recordsByType: {},
   };
+}
+
+function metricsTemplate() {
+  return {
+    durationMs: null,
+    context: { sampleCount: 0, last: null, peak: null, cumulative: null },
+    compactions: [],
+    _contextSamples: [],
+  };
+}
+
+function finiteNumber(...values) {
+  for (const value of values) {
+    if (value == null || value === '') continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function addContextSample(session, sample) {
+  if (!sample || sample.inputTokens == null) return;
+  session.metrics._contextSamples.push(sample);
+}
+
+function mergeMetricSample(left, right) {
+  const merged = { ...left };
+  for (const key of [
+    'inputTokens', 'cachedInputTokens', 'cacheCreationInputTokens', 'outputTokens',
+    'reasoningOutputTokens', 'totalTokens', 'contextWindow',
+  ]) {
+    const values = [left[key], right[key]].filter((value) => value != null);
+    merged[key] = values.length ? Math.max(...values) : null;
+  }
+  if ((Date.parse(right.timestamp) || 0) >= (Date.parse(left.timestamp) || 0)) {
+    merged.timestamp = right.timestamp;
+    merged.line = right.line;
+  }
+  merged.cumulative = right.cumulative || left.cumulative;
+  return merged;
+}
+
+function pairedCompaction(existing, detail, millis) {
+  const other = Date.parse(existing.timestamp);
+  if (!Number.isFinite(millis) || !Number.isFinite(other)) return false;
+  const sources = new Set([existing.source, detail.source]);
+  if (sources.has('compacted') && sources.has('event_msg')) {
+    return Math.abs(millis - other) <= CODEX_COMPACTION_PAIR_MS;
+  }
+  const hasSummary = [...sources].some((source) => /compact summary/i.test(source || ''));
+  const hasBoundary = [...sources].some((source) => /compact[_ ](?:boundary|metadata)/i.test(source || ''));
+  return hasSummary && hasBoundary && Math.abs(millis - other) <= CLAUDE_COMPACTION_PAIR_MS;
+}
+
+function addStatus(session, type, record, detail = {}) {
+  const timestamp = record.timestamp || (record.payload && record.payload.timestamp);
+  if (type === 'context_compacted') {
+    const millis = Date.parse(timestamp);
+    const existing = [...session.metrics.compactions].reverse()
+      .find((item) => pairedCompaction(item, detail, millis));
+    if (existing) {
+      for (const [key, value] of Object.entries(detail)) {
+        if (value != null && existing[key] == null) existing[key] = value;
+      }
+      return;
+    }
+    const compaction = { timestamp, ...detail };
+    session.metrics.compactions.push(compaction);
+    session.events.push({
+      kind: 'status', statusType: type, text: 'context compacted',
+      timestamp, line: detail.line,
+    });
+    return;
+  }
+  session.events.push({
+    kind: 'status', statusType: type, text: type.replaceAll('_', ' '),
+    timestamp, line: detail.line,
+  });
+}
+
+function normalizeUsage(values = {}) {
+  return {
+    inputTokens: finiteNumber(values.input_tokens, values.inputTokens),
+    cachedInputTokens: finiteNumber(values.cached_input_tokens, values.cache_read_input_tokens, values.cachedInputTokens),
+    cacheCreationInputTokens: finiteNumber(values.cache_creation_input_tokens, values.cacheCreationInputTokens),
+    outputTokens: finiteNumber(values.output_tokens, values.outputTokens),
+    reasoningOutputTokens: finiteNumber(values.reasoning_output_tokens, values.reasoningOutputTokens),
+    totalTokens: finiteNumber(values.total_tokens, values.totalTokens),
+  };
+}
+
+function finalizeMetrics(session) {
+  const { meta, metrics } = session;
+  if (Number.isFinite(meta._startedMs) && Number.isFinite(meta._endedMs)) {
+    metrics.durationMs = Math.max(0, meta._endedMs - meta._startedMs);
+  }
+
+  const samplesByKey = new Map();
+  for (const sample of metrics._contextSamples) {
+    const key = sample.key || `${sample.timestamp || ''}:${sample.line || ''}`;
+    samplesByKey.set(key, samplesByKey.has(key)
+      ? mergeMetricSample(samplesByKey.get(key), sample)
+      : sample);
+  }
+  const samples = [...samplesByKey.values()].sort((left, right) =>
+    (Date.parse(left.timestamp) || 0) - (Date.parse(right.timestamp) || 0)
+    || (left.line || 0) - (right.line || 0));
+  for (const sample of samples) {
+    sample.occupancyPercent = sample.contextWindow
+      ? (sample.inputTokens / sample.contextWindow) * 100
+      : null;
+    delete sample.key;
+  }
+
+  const last = samples.at(-1) || null;
+  const peak = samples.reduce((current, sample) => {
+    if (!current) return sample;
+    return sample.inputTokens > current.inputTokens ? sample : current;
+  }, null);
+  const cumulativeSample = [...samples].reverse().find((sample) => sample.cumulative);
+  let cumulative = cumulativeSample && cumulativeSample.cumulative;
+  if (!cumulative && samples.length) {
+    cumulative = {
+      inputTokens: samples.reduce((sum, sample) => sum + (sample.inputTokens || 0), 0),
+      cachedInputTokens: samples.reduce((sum, sample) => sum + (sample.cachedInputTokens || 0), 0),
+      cacheCreationInputTokens: samples.reduce((sum, sample) => sum + (sample.cacheCreationInputTokens || 0), 0),
+      outputTokens: samples.reduce((sum, sample) => sum + (sample.outputTokens || 0), 0),
+      reasoningOutputTokens: samples.reduce((sum, sample) => sum + (sample.reasoningOutputTokens || 0), 0),
+    };
+    cumulative.totalTokens = cumulative.inputTokens + cumulative.outputTokens
+      + cumulative.reasoningOutputTokens;
+  }
+  metrics.context = { sampleCount: samples.length, last, peak, cumulative: cumulative || null };
+  metrics.compactions.sort((left, right) =>
+    (Date.parse(left.timestamp) || 0) - (Date.parse(right.timestamp) || 0));
+  delete metrics._contextSamples;
 }
 
 function updateMeta(meta, record, payload = {}) {
@@ -158,9 +296,72 @@ function addTextEvent(events, kind, text, record, line) {
   events.push({ kind, text, timestamp: record.timestamp, line });
 }
 
+function contextWindowFrom(record, usage = {}) {
+  const message = record.message || {};
+  return finiteNumber(
+    usage.model_context_window, usage.context_window, usage.modelContextWindow, usage.contextWindow,
+    message.model_context_window, message.context_window, message.modelContextWindow, message.contextWindow,
+    record.model_context_window, record.context_window, record.modelContextWindow, record.contextWindow,
+  );
+}
+
+function addClaudeUsage(session, record, line) {
+  const message = record.message || {};
+  const usage = message.usage;
+  if (!usage || typeof usage !== 'object') return;
+  const normalized = normalizeUsage(usage);
+  const baseInput = normalized.inputTokens;
+  const cached = normalized.cachedInputTokens || 0;
+  const cacheCreation = normalized.cacheCreationInputTokens || 0;
+  if (baseInput == null && !cached && !cacheCreation) return;
+  const inputTokens = (baseInput || 0) + cached + cacheCreation;
+  const outputTokens = normalized.outputTokens || 0;
+  const reasoningOutputTokens = normalized.reasoningOutputTokens || 0;
+  addContextSample(session, {
+    key: `claude:${message.id || record.requestId || record.uuid || line}`,
+    timestamp: record.timestamp,
+    line,
+    inputTokens,
+    cachedInputTokens: cached,
+    cacheCreationInputTokens: cacheCreation,
+    outputTokens,
+    reasoningOutputTokens,
+    totalTokens: inputTokens + outputTokens + reasoningOutputTokens,
+    contextWindow: contextWindowFrom(record, usage),
+  });
+}
+
+function claudeCompactionDetail(record, line) {
+  const metadata = record.compact_metadata || record.compactMetadata || {};
+  const subtype = String(record.subtype || '');
+  const isCompaction = record.isCompactSummary === true
+    || /compact/i.test(subtype)
+    || record.compact_metadata != null
+    || record.compactMetadata != null;
+  if (!isCompaction) return null;
+  return {
+    line,
+    source: subtype || (record.isCompactSummary ? 'compact summary' : 'compact metadata'),
+    trigger: metadata.trigger,
+    preTokens: finiteNumber(metadata.pre_tokens, metadata.preTokens),
+  };
+}
+
 function parseClaudeRecord(record, line, session) {
   const { events, coverage, meta } = session;
+  if (record.agentId) {
+    meta.agentId ||= record.agentId;
+    meta.sessionId ||= record.sessionId;
+    meta.parentThreadId ||= record.sessionId;
+  }
   updateMeta(meta, record);
+
+  const compaction = claudeCompactionDetail(record, line);
+  if (compaction) {
+    addStatus(session, 'context_compacted', record, compaction);
+    coverage.omittedSystem += 1;
+    return true;
+  }
 
   if (record.type === 'system') {
     coverage.omittedSystem += 1;
@@ -170,6 +371,8 @@ function parseClaudeRecord(record, line, session) {
     return true;
   }
   if (record.type !== 'user' && record.type !== 'assistant') return false;
+
+  if (record.type === 'assistant') addClaudeUsage(session, record, line);
 
   const content = record.message && record.message.content;
   if (typeof content === 'string') {
@@ -223,6 +426,22 @@ function codexMessageText(payload) {
 function codexInjectedUserText(text) {
   return /^(?:<environment_context>|<system-reminder>|<skills_instructions>|<collaboration_mode>|<recommended_plugins>|<apps_instructions>|<plugins_instructions>|<permissions instructions>|<INSTRUCTIONS>|# AGENTS\.md instructions\b)/i
     .test(String(text).trimStart());
+}
+
+function addCodexUsage(session, record, line) {
+  const info = record.payload && record.payload.info;
+  if (!info || typeof info !== 'object') return;
+  const last = normalizeUsage(info.last_token_usage || info.lastTokenUsage || {});
+  if (last.inputTokens == null) return;
+  const cumulative = normalizeUsage(info.total_token_usage || info.totalTokenUsage || {});
+  addContextSample(session, {
+    key: `codex:${record.timestamp || line}:${line}`,
+    timestamp: record.timestamp,
+    line,
+    ...last,
+    contextWindow: finiteNumber(info.model_context_window, info.context_window, info.modelContextWindow, info.contextWindow),
+    cumulative: cumulative.inputTokens == null ? null : cumulative,
+  });
 }
 
 function parseCodexRecord(record, line, session, eventMessageRoles) {
@@ -306,18 +525,27 @@ function parseCodexRecord(record, line, session, eventMessageRoles) {
       addTextEvent(events, role, typeof text === 'string' ? text : stringifyResult(text), record, line);
       return true;
     }
+    if (type === 'token_count') {
+      addCodexUsage(session, record, line);
+      return true;
+    }
     if (['user_message', 'agent_message', 'agent_reasoning', 'token_count', 'task_started', 'task_complete', 'patch_apply_end', 'sub_agent_activity', 'web_search_end'].includes(type)) {
       if (type === 'agent_reasoning') coverage.omittedReasoning += 1;
       return true;
     }
     if (['turn_aborted', 'context_compacted', 'thread_rolled_back'].includes(type)) {
-      events.push({ kind: 'status', text: type.replaceAll('_', ' '), detail: payload, timestamp: record.timestamp, line });
+      addStatus(session, type, record, { line, source: 'event_msg' });
       return true;
     }
     return false;
   }
   if (record.type === 'compacted') {
-    events.push({ kind: 'status', text: 'context compacted', timestamp: record.timestamp, line });
+    addStatus(session, 'context_compacted', record, {
+      line,
+      source: 'compacted',
+      windowId: payload.window_id,
+      windowNumber: finiteNumber(payload.window_number),
+    });
     return true;
   }
   if (record.type === 'world_state' || record.type === 'inter_agent_communication_metadata') return true;
@@ -345,7 +573,7 @@ function parseTranscript(text, provider = 'auto', sourceFile = '') {
   const meta = { provider: resolvedProvider, sourceFile };
   const fileMatch = path.basename(sourceFile || '').match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i);
   if (fileMatch) meta.fileId = fileMatch[0];
-  const session = { meta, events: [], coverage };
+  const session = { meta, events: [], coverage, metrics: metricsTemplate(), agentSessions: [] };
 
   let activeNodes = null;
   if (resolvedProvider === 'claude-code') {
@@ -366,6 +594,11 @@ function parseTranscript(text, provider = 'auto', sourceFile = '') {
     else coverage.unknownRecords += 1;
   }
 
+  if (meta.agentId) {
+    meta.sessionId ||= meta.id;
+    meta.id = meta.agentId;
+  }
+  finalizeMetrics(session);
   delete meta._startedMs;
   delete meta._endedMs;
   delete meta.fileId;
@@ -456,6 +689,35 @@ function plural(count, singular, pluralForm = `${singular}s`) {
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+function formatDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds)) return 'unavailable';
+  if (milliseconds < 1_000) return `${Math.round(milliseconds)}ms`;
+  const totalSeconds = milliseconds / 1_000;
+  const secondsText = (seconds) => Number.isInteger(seconds)
+    ? String(seconds)
+    : seconds.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  if (totalSeconds < 60) return `${secondsText(totalSeconds)}s`;
+  const wholeSeconds = Math.floor(totalSeconds);
+  const days = Math.floor(wholeSeconds / 86_400);
+  const hours = Math.floor((wholeSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((wholeSeconds % 3_600) / 60);
+  const seconds = totalSeconds - Math.floor(totalSeconds / 60) * 60;
+  return [days && `${days}d`, hours && `${hours}h`, minutes && `${minutes}m`, seconds && `${secondsText(seconds)}s`]
+    .filter(Boolean).join(' ');
+}
+
+function formatNumber(value) {
+  return Number.isFinite(value) ? new Intl.NumberFormat('en-US').format(value) : 'unavailable';
+}
+
+function formatContextPoint(point) {
+  if (!point || !Number.isFinite(point.inputTokens)) return 'unavailable';
+  if (!Number.isFinite(point.contextWindow)) {
+    return `${formatNumber(point.inputTokens)} tokens (window unavailable)`;
+  }
+  return `${formatNumber(point.inputTokens)} / ${formatNumber(point.contextWindow)} tokens (${point.occupancyPercent.toFixed(1)}%)`;
+}
+
 function renderReport(session, options = {}) {
   const redact = options.redact !== false;
   const metaInline = (value) => inline(redact ? redactValue(String(value == null ? '—' : value)) : value);
@@ -463,13 +725,22 @@ function renderReport(session, options = {}) {
   const failed = calls.filter((call) => call.result && call.result.isError);
   const missing = calls.filter((call) => !call.result);
   const statuses = session.events.filter((event) => event.kind === 'status');
+  const interruptions = statuses.filter((event) => event.statusType === 'turn_aborted');
+  const rollbacks = statuses.filter((event) => event.statusType === 'thread_rolled_back');
   const conversation = session.events.filter((event) => event.kind === 'user' || event.kind === 'assistant');
+  const metrics = session.metrics || metricsTemplate();
+  const context = metrics.context || { sampleCount: 0, last: null, peak: null, cumulative: null };
+  const agents = session.agentSessions && session.agentSessions.length
+    ? session.agentSessions
+    : [agentSessionSummary(session)];
   const parts = [
     '# Session analysis', '',
     `- **Provider:** ${metaInline(session.meta.provider)}`,
     `- **Session:** ${metaInline(session.meta.id)}`,
     `- **Project:** ${metaInline(session.meta.cwd)}`,
     `- **Time:** ${metaInline(session.meta.startedAt)} → ${metaInline(session.meta.endedAt)}`,
+    `- **Observed duration:** ${formatDuration(metrics.durationMs)}`,
+    `- **Subagent sessions:** ${Math.max(0, agents.length - 1)}`,
     `- **Model:** ${metaInline(session.meta.model)}`,
     `- **Version:** ${metaInline(session.meta.version)}`,
     `- **Source:** ${metaInline(session.meta.sourceFile)}`,
@@ -478,12 +749,45 @@ function renderReport(session, options = {}) {
     `- ${plural(failed.length, 'failed tool call')}.`,
     `- ${plural(missing.length, 'tool call')} without a recorded result.`,
     `- ${plural(unmatchedResults.length, 'tool result')} without a matching earlier call.`,
-    `- ${plural(statuses.length, 'interruption, rollback, or compaction signal')}.`,
+    `- ${plural(interruptions.length, 'interruption')}, ${plural(rollbacks.length, 'rollback')}, and ${plural(metrics.compactions.length, 'compaction')}.`,
     `- ${plural(session.coverage.malformedLines, 'malformed JSONL line')} and ${plural(session.coverage.unknownRecords, 'unknown record')} skipped.`,
     `- ${plural(session.coverage.sideBranchRecords, 'Claude side-branch record')} excluded from the active branch.`,
     `- ${plural(session.coverage.omittedReasoning, 'reasoning block')} and ${plural(session.coverage.omittedSystem, 'system/context record')} intentionally omitted.`,
-    '', '## Conversation', '',
+    '', '## Agent sessions', '',
+    '| Role | Session | Parent | Start | End | Duration | Peak input context | Compactions |',
+    '| --- | --- | --- | --- | --- | ---: | --- | ---: |',
   ];
+
+  for (const agent of agents) {
+    parts.push(`| ${inline(agent.role)} | ${metaInline(agent.id)} | ${metaInline(agent.parentId)} | ${metaInline(agent.startedAt)} | ${metaInline(agent.endedAt)} | ${formatDuration(agent.durationMs)} | ${inline(formatContextPoint(agent.context && agent.context.peak))} | ${agent.compactions || 0} |`);
+  }
+
+  const cumulative = context.cumulative || {};
+  parts.push(
+    '', '## Context and compaction', '',
+    '| Metric | Value |', '| --- | ---: |',
+    `| Context samples | ${context.sampleCount || 0} |`,
+    `| Final observed input | ${inline(formatContextPoint(context.last))} |`,
+    `| Peak observed input | ${inline(formatContextPoint(context.peak))} |`,
+    `| Recorded cumulative input | ${formatNumber(cumulative.inputTokens)} |`,
+    `| Recorded cumulative output | ${formatNumber(cumulative.outputTokens)} |`,
+    `| Recorded cumulative total | ${formatNumber(cumulative.totalTokens)} |`,
+    `| Compactions | ${metrics.compactions.length} |`,
+    '',
+  );
+  if (metrics.compactions.length) {
+    parts.push('| # | Time | Trigger | Pre-compact tokens | Window |', '| ---: | --- | --- | ---: | --- |');
+    for (const [index, compaction] of metrics.compactions.entries()) {
+      const window = compaction.windowNumber != null
+        ? `#${compaction.windowNumber}`
+        : (compaction.windowId || 'unavailable');
+      parts.push(`| ${index + 1} | ${metaInline(compaction.timestamp)} | ${metaInline(compaction.trigger || 'unavailable')} | ${formatNumber(compaction.preTokens)} | ${metaInline(window)} |`);
+    }
+    parts.push('');
+  } else {
+    parts.push('_No compaction signals were recorded._', '');
+  }
+  parts.push('Token values are transcript-reported. Context percentages are shown only when the transcript supplies a context-window size.', '', '## Conversation', '');
 
   if (conversation.length === 0) parts.push('_No visible user or assistant messages were parsed._', '');
   for (const event of conversation) {
@@ -581,6 +885,8 @@ function inspectCandidate(file, provider) {
   let identity;
   let fallbackIdentity;
   let id;
+  let sessionId;
+  let agentId;
   let cwd;
   let version;
   let transcriptUpdatedMs;
@@ -595,7 +901,8 @@ function inspectCandidate(file, provider) {
       fallbackIdentity ||= payload;
       if (filenameId && (payload.id === filenameId || payload.session_id === filenameId)) identity = payload;
     } else if (provider === 'claude-code' && (record.type === 'user' || record.type === 'assistant')) {
-      id ||= record.sessionId;
+      sessionId ||= record.sessionId;
+      agentId ||= record.agentId;
       cwd ||= record.cwd;
       version ||= record.version;
     }
@@ -606,12 +913,21 @@ function inspectCandidate(file, provider) {
     cwd = identity.cwd;
     version = identity.cli_version;
   } else {
-    id ||= filenameId || path.basename(file, '.jsonl');
+    const inSubagentsDirectory = file.split(path.sep).includes('subagents');
+    if (inSubagentsDirectory || agentId) {
+      agentId ||= path.basename(file, '.jsonl').replace(/^agent-/, '');
+      id = agentId;
+    } else {
+      id = sessionId || filenameId || path.basename(file, '.jsonl');
+    }
   }
+  const parentThreadId = provider === 'codex'
+    ? identity && identity.parent_thread_id
+    : (agentId ? sessionId : null);
   return {
     provider, id, cwd, version, file, updatedMs: transcriptUpdatedMs || stat.mtimeMs,
     updatedAt: new Date(transcriptUpdatedMs || stat.mtimeMs).toISOString(),
-    parentThreadId: identity && identity.parent_thread_id,
+    parentThreadId, agentId, sessionId, isSubagent: !!parentThreadId,
     active: provider === 'codex' && !!process.env.CODEX_THREAD_ID && id === process.env.CODEX_THREAD_ID,
   };
 }
@@ -713,13 +1029,63 @@ function analyzeFile(file, provider = 'auto') {
   return session;
 }
 
+function agentSessionSummary(session, overrides = {}) {
+  return {
+    role: session.meta.parentThreadId ? 'Subagent' : 'Root',
+    id: session.meta.id,
+    parentId: session.meta.parentThreadId || null,
+    provider: session.meta.provider,
+    startedAt: session.meta.startedAt,
+    endedAt: session.meta.endedAt,
+    durationMs: session.metrics.durationMs,
+    context: session.metrics.context,
+    compactions: session.metrics.compactions.length,
+    ...overrides,
+  };
+}
+
+function attachAgentSessions(session, candidates = []) {
+  const rootId = session.meta.id;
+  const summaries = [agentSessionSummary(session)];
+  const seen = new Set([rootId]);
+  const queue = [rootId];
+
+  while (queue.length) {
+    const parentId = queue.shift();
+    const children = candidates
+      .filter((candidate) => candidate.parentThreadId === parentId && !seen.has(candidate.id))
+      .sort((left, right) => left.updatedMs - right.updatedMs || String(left.id).localeCompare(String(right.id)));
+    for (const candidate of children) {
+      seen.add(candidate.id);
+      let summary;
+      try {
+        const child = analyzeFile(candidate.file, candidate.provider);
+        summary = agentSessionSummary(child, {
+          role: 'Subagent', id: candidate.id, parentId, provider: candidate.provider,
+        });
+      } catch {
+        summary = {
+          role: 'Subagent', id: candidate.id, parentId, provider: candidate.provider,
+          startedAt: null, endedAt: null, durationMs: null,
+          context: { sampleCount: 0, last: null, peak: null, cumulative: null },
+          compactions: 0,
+        };
+      }
+      summaries.push(summary);
+      queue.push(candidate.id);
+    }
+  }
+  session.agentSessions = summaries;
+  return session;
+}
+
 function helpText() {
   return `Usage: node analyze-session.js [options]\n\n` +
     `  --source <auto|codex|claude-code>  Transcript provider (default: auto)\n` +
     `  --session <current|latest|previous|ID|PATH> Session selector (default: latest)\n` +
     `  --project, --cwd <PATH>             Project scope (default: current directory)\n` +
     `  --list                              List matching sessions without reading content\n` +
-    `  --include-agents                    Include sub-agent sessions\n` +
+    `  --include-agents                    Allow listing/selecting sub-agent transcripts\n` +
     `  --output <PATH|->                   Report path; '-' writes Markdown to stdout\n` +
     `  --no-redact                         Disable default secret redaction\n` +
     `  --help                              Show this help\n`;
@@ -775,6 +1141,7 @@ function printCandidates(candidates) {
   if (!candidates.length) return 'No matching sessions found.';
   return candidates.map((candidate, index) => [
     `${index + 1}.`, candidate.provider, candidate.active ? '[CURRENT]' : '',
+    candidate.isSubagent ? `[SUBAGENT parent=${candidate.parentThreadId}]` : '',
     candidate.updatedAt, candidate.id || '(unknown-id)', candidate.cwd || '(unknown-cwd)', candidate.file,
   ].filter(Boolean).join(' ')).join('\n');
 }
@@ -836,6 +1203,13 @@ function main(argv = process.argv.slice(2)) {
 
   const session = analyzeFile(inputFile, provider);
   if (session.meta.active) console.warn('Warning: this is the current Codex session and may be incomplete.');
+  const agentCandidates = discoverCandidates({
+    ...options,
+    source: session.meta.provider,
+    project: null,
+    includeAgents: true,
+  });
+  attachAgentSessions(session, agentCandidates);
   const report = renderReport(session, { redact: options.redact });
   const output = options.output || outputPathFor(session);
   if (output === '-') {
@@ -852,6 +1226,7 @@ function main(argv = process.argv.slice(2)) {
 
 module.exports = {
   analyzeFile,
+  attachAgentSessions,
   detectProvider,
   discoverCandidates,
   main,
