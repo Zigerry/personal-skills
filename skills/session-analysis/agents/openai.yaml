@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Analysis"
+  short_description: "Turn Codex or Claude sessions into readable audits"
+  default_prompt: "Use $session-analysis to explain the previous coding session and highlight failures and unfinished work."
