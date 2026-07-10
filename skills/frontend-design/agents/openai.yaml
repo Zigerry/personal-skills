@@ -1,4 +1,4 @@
 interface:
-  display_name: "前端设计"
+  display_name: "Frontend Design"
   short_description: "为产品建立鲜明视觉方向并实现经过验证的响应式前端界面"
   default_prompt: "使用 $frontend-design 为这个界面建立独特视觉方向，并实现、截图和复查最终效果。"
