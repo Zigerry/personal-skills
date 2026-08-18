@@ -1,0 +1,4 @@
+interface:
+  display_name: "大规模层级 HTML"
+  short_description: "生成并优化可流畅浏览的超大规模层级 HTML 报告"
+  default_prompt: "使用 $scalable-hierarchy-html 分析并优化这个大规模层级 HTML 报告，确保初始渲染和交互保持流畅。"

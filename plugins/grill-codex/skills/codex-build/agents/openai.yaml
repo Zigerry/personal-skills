@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Build"
+  short_description: "按批准方案实施、验证，并通过独立只读 subagent 审查"
+  default_prompt: "按已批准方案实施变更，保持单一写入者，并完成独立审查和验证。"
+policy:
+  allow_implicit_invocation: true

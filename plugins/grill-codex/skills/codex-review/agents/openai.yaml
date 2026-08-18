@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Plan Review"
+  short_description: "使用独立 subagent 对实现方案进行有限轮次的多视角审查"
+  default_prompt: "对这个实现方案进行独立多视角审查，并给出可执行的修订结论。"
+policy:
+  allow_implicit_invocation: true
