@@ -1,6 +1,0 @@
-interface:
-  display_name: "Grill with Docs for Codex"
-  short_description: "对照项目术语、上下文与 ADR 澄清方案并完成独立多视角审查"
-  default_prompt: "对照项目术语、ADR 和代码逐项澄清方案，再完成独立审查。"
-policy:
-  allow_implicit_invocation: true
